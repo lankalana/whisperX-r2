@@ -1,7 +1,6 @@
 import whisperx
 import gc
 import time
-import librosa
 import os
 import torch
 from datetime import datetime
@@ -29,7 +28,7 @@ print(f"  Batch size: {batch_size}")
 print(f"  Compute type: {compute_type}")
 
 # Start timing
-start_time = time.time()
+processing_start_time = time.time()
 
 # save model to local path (optional)
 #model_dir = os.path.expanduser("~/dev/models")
@@ -82,8 +81,8 @@ for i, segment in enumerate(result["segments"][:3]):  # Show first 3 segments
 print(f"\n[7/10] LOADING DIARIZATION MODEL...")
 hftoken = os.getenv("HF_TOKEN")
 print("hftoken:", hftoken)
-diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=hftoken, device=device)
-#diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=os.getenv("HF_TOKEN"), device=device)
+diarize_model = whisperx.diarize.DiarizationPipeline(token=hftoken, device=device)
+#diarize_model = whisperx.diarize.DiarizationPipeline(token=os.getenv("HF_TOKEN"), device=device)
 print(f"  ✓ Diarization model loaded")
 
 print(f"\n[8/10] PERFORMING SPEAKER DIARIZATION...")
@@ -128,7 +127,7 @@ print(f"  ✓ Results saved to {output_file}")
 
 # Calculate and display timing results
 end_time = time.time()
-processing_time = end_time - start_time
+processing_time = time.time() - processing_start_time
 speed_ratio = audio_duration / processing_time
 
 print(f"\n" + "=" * 50)

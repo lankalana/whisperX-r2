@@ -73,7 +73,7 @@ class AudioFileMonitor:
 
             # Load diarization model
             hftoken = os.getenv("HF_TOKEN")
-            self.diarize_model = whisperx.diarize.DiarizationPipeline(use_auth_token=hftoken, device=self.device)
+            self.diarize_model = whisperx.diarize.DiarizationPipeline(token=hftoken, device=self.device)
             logger.info("✓ Diarization model loaded")
 
             # Note: Alignment model will be loaded dynamically based on detected language

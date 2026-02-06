@@ -15,16 +15,15 @@ class DiarizationPipeline:
     def __init__(
         self,
         model_name=None,
-        use_auth_token=None,
+        token=None,
         device: Optional[Union[str, torch.device]] = "cpu",
     ):
         if isinstance(device, str):
             device = torch.device(device)
 
-        suppress_reproducibility_warnings()
         model_config = model_name or "pyannote/speaker-diarization-3.1"
         logger.info(f"Loading diarization model: {model_config}")
-        self.model = Pipeline.from_pretrained(model_config, use_auth_token=use_auth_token).to(device)
+        self.model = Pipeline.from_pretrained(model_config, token=token).to(device)
 
         # Re-enable TF32 after pyannote modified it
         try:
@@ -82,7 +81,7 @@ class DiarizationPipeline:
             )
             embeddings = None
 
-        diarize_df = pd.DataFrame(diarization.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
+        diarize_df = pd.DataFrame(diarization.speaker_diarization.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
         diarize_df['start'] = diarize_df['segment'].apply(lambda x: x.start)
         diarize_df['end'] = diarize_df['segment'].apply(lambda x: x.end)
 
