@@ -1,0 +1,7 @@
+.git/
+.idea/
+.cache/
+.venv/
+**/__pycache__/
+
+audio/
