@@ -24,8 +24,12 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 	&& rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/venv /opt/whisperx-venv
 
-ENV HF_HOME=/app/.cache/hf
-ENV TORCHINDUCTOR_CACHE_DIR=/app/.cache/torch
-ENV TRITON_CACHE_DIR=/app/.cache/triton
+RUN /opt/whisperx-venv/bin/python -m pip install boto3
+COPY audio_file_monitor.py /app/audio_file_monitor.py
 
-ENTRYPOINT ["/opt/whisperx-venv/bin/python", "-m", "whisperx"]
+ENV HF_HOME=/root/.cache/hf
+ENV TORCHINDUCTOR_CACHE_DIR=/root/.cache/torch
+ENV TRITON_CACHE_DIR=/root/.cache/triton
+ENV XDG_CACHE_HOME=/root/.cache/xdg
+
+ENTRYPOINT ["/opt/whisperx-venv/bin/python", "/app/audio_file_monitor.py"]

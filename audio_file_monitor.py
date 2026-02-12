@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Audio File Monitor and Transcription System
-Monitors input directory for MP3, M4A and MP4 files and transcribes them using WhisperX
+Audio File Monitor and Transcription System (S3)
+Monitors S3 input bucket for MP3, M4A and MP4 files and transcribes them using WhisperX
 For MP4 files, only the audio track is processed.
+Uploads transcript artifacts to a separate S3 output bucket.
 """
 
 import os
 import time
-import shutil
 import threading
 import json
-import argparse
 import re
+import tempfile
 from pathlib import Path
 import whisperx
 import gc
 import torch
+import boto3
+from botocore.exceptions import ClientError
 from datetime import datetime
 import logging
 
@@ -24,23 +26,39 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('audio_file_monitor.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 class AudioFileMonitor:
-    def __init__(self, input_dirs=None):
-        if input_dirs is None:
-            input_dirs = ["./input"]
-        self.input_dirs = [Path(d) for d in input_dirs]
+    def __init__(self):
+        self.input_bucket = self.get_required_env("S3_INPUT_BUCKET")
+        self.output_bucket = self.get_required_env("S3_OUTPUT_BUCKET")
+        self.s3_client = boto3.client("s3")
         self.processing_lock = threading.Lock()
         self.current_language = None
         self.model_a = None
         self.metadata = None
         self.supported_extensions = {'.mp3', '.m4a', '.mp4'}
+        self.setup_s3()
         self.setup_whisperx()
+
+    @staticmethod
+    def get_required_env(name):
+        """Fetch required environment variable value."""
+        value = os.getenv(name)
+        if value is None or not value.strip():
+            raise ValueError(f"Missing required environment variable: {name}")
+        return value.strip()
+
+    def setup_s3(self):
+        """Verify S3 buckets are reachable."""
+        logger.info("Validating S3 bucket access...")
+        self.s3_client.head_bucket(Bucket=self.input_bucket)
+        self.s3_client.head_bucket(Bucket=self.output_bucket)
+        logger.info(f"✓ Input bucket: {self.input_bucket}")
+        logger.info(f"✓ Output bucket: {self.output_bucket}")
 
     def detect_language_from_filename(self, filename):
         """Detect language from filename patterns"""
@@ -96,49 +114,88 @@ class AudioFileMonitor:
         else:
             logger.info(f"Alignment model for {language_code} already loaded")
 
-    def process_audio_file(self, file_path):
-        """Process a single audio file (MP3, M4A, or MP4)"""
+    def list_audio_objects(self):
+        """List audio objects from input bucket."""
+        paginator = self.s3_client.get_paginator("list_objects_v2")
+        audio_objects = []
+
+        for page in paginator.paginate(Bucket=self.input_bucket):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):
+                    continue
+                if Path(key).suffix.lower() in self.supported_extensions:
+                    audio_objects.append(obj)
+
+        audio_objects.sort(key=lambda obj: obj["LastModified"])
+        return audio_objects
+
+    def build_markdown_output_key(self, object_key):
+        """Build output key for markdown transcript at output bucket root."""
+        return f"{Path(object_key).stem}.md"
+
+    def upload_markdown_transcript(self, output_dir, object_key):
+        """Upload only the markdown transcript file to output bucket root."""
+        markdown_filename = self.build_markdown_output_key(object_key)
+        markdown_path = Path(output_dir) / markdown_filename
+        if not markdown_path.exists():
+            raise FileNotFoundError(f"Expected markdown transcript not found: {markdown_path}")
+
+        self.s3_client.upload_file(str(markdown_path), self.output_bucket, markdown_filename)
+        logger.info(f"Uploaded markdown: s3://{self.output_bucket}/{markdown_filename}")
+
+    def is_already_processed(self, object_key):
+        """
+        Check whether object has already been processed by looking for markdown
+        transcript in the output bucket root.
+        """
+        markdown_key = self.build_markdown_output_key(object_key)
+        try:
+            self.s3_client.head_object(Bucket=self.output_bucket, Key=markdown_key)
+            return True
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise
+
+    def process_s3_object(self, object_key):
+        """Process a single S3 audio object (MP3, M4A, or MP4)."""
         with self.processing_lock:
             try:
-                file_path = Path(file_path)
-                logger.info(f"Processing audio file: {file_path.name}")
+                object_path = Path(object_key)
+                logger.info(f"Processing object: s3://{self.input_bucket}/{object_key}")
 
-                # Get the parent directory (the input directory where the file was found)
-                parent_dir = file_path.parent
+                filename_base = object_path.stem
 
-                # Create directory structure: [parent_dir]/[filename]/
-                filename_base = file_path.stem  # filename without extension
-                target_dir = parent_dir / filename_base
-                target_dir.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix="whisperx-s3-") as temp_dir:
+                    local_root = Path(temp_dir)
+                    target_dir = local_root / filename_base
+                    target_dir.mkdir(parents=True, exist_ok=True)
 
-                # Move audio file to target directory
-                new_audio_path = target_dir / file_path.name
-                if file_path.exists():
-                    shutil.move(str(file_path), str(new_audio_path))
-                    logger.info(f"Moved {file_path.name} to {target_dir}")
-                else:
-                    logger.warning(f"File {file_path} no longer exists")
-                    return
+                    local_audio_path = target_dir / object_path.name
 
-                # Detect language from filename
-                language_code = self.detect_language_from_filename(file_path.name)
-                logger.info(f"Detected language: {language_code}")
+                    logger.info(f"Downloading s3://{self.input_bucket}/{object_key}")
+                    self.s3_client.download_file(self.input_bucket, object_key, str(local_audio_path))
 
-                # Load alignment model for the detected language
-                self.load_alignment_model(language_code)
+                    # Detect language from filename
+                    language_code = self.detect_language_from_filename(object_path.name)
+                    logger.info(f"Detected language: {language_code}")
 
-                # Transcribe the file
-                self.transcribe_file(new_audio_path, target_dir)
+                    # Load alignment model for the detected language
+                    self.load_alignment_model(language_code)
+
+                    # Transcribe the file
+                    self.transcribe_file(local_audio_path, target_dir)
+
+                    # Upload only markdown transcript (no directory prefix)
+                    self.upload_markdown_transcript(target_dir, object_key)
+
+                return True
 
             except Exception as e:
-                logger.error(f"Error processing {file_path}: {e}")
-                # Save error log to target directory if it exists
-                if 'target_dir' in locals():
-                    error_file = target_dir / "error.log"
-                    with open(error_file, 'w', encoding='utf-8') as f:
-                        f.write(f"Error processing {file_path.name}\n")
-                        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        f.write(f"Error: {str(e)}\n")
+                logger.error(f"Error processing s3://{self.input_bucket}/{object_key}: {e}")
+                return False
 
     def transcribe_file(self, audio_path, output_dir):
         """Transcribe audio file using WhisperX pipeline"""
@@ -202,40 +259,11 @@ class AudioFileMonitor:
         """Save transcript to file"""
         # Use base filename without extension for output files
         base_filename = audio_path.stem
-        transcript_file = output_dir / f"{base_filename}.txt"
         markdown_file = output_dir / f"{base_filename}.md"
-        json_file = output_dir / f"{base_filename}.json"
-
-        processing_time = time.time() - start_time
-        speed_ratio = audio_duration / processing_time
-
-        # Save .txt format (existing)
-        with open(transcript_file, 'w', encoding='utf-8') as f:
-            f.write(f"Diarized Transcript - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Audio file: {audio_path.name}\n")
-            f.write(f"Language: {self.current_language}\n")
-            f.write(f"Device: {self.device}\n")
-            f.write(f"Duration: {audio_duration:.2f} seconds\n")
-            f.write(f"Processing time: {processing_time:.2f} seconds\n")
-            f.write(f"Speed ratio: {speed_ratio:.2f}x\n")
-            f.write("=" * 50 + "\n\n")
-
-            for i, segment in enumerate(result["segments"]):
-                speaker = segment.get('speaker', 'UNKNOWN')
-                start_time_seg = segment['start']
-                end_time_seg = segment['end']
-                text = segment['text']
-                f.write(f"[{i + 1:03d}] {speaker} ({start_time_seg:.2f}s-{end_time_seg:.2f}s): {text}\n")
 
         # Save .md format (new)
         self.save_markdown_transcript(result, audio_path, markdown_file, audio_duration, start_time)
-
-        # Save .json format (new)
-        self.save_json_transcript(result, audio_path, json_file, audio_duration, start_time)
-
-        logger.info(f"Transcript saved to {transcript_file}")
         logger.info(f"Markdown transcript saved to {markdown_file}")
-        logger.info(f"JSON transcript saved to {json_file}")
 
     def save_markdown_transcript(self, result, audio_path, markdown_file, audio_duration, start_time):
         """Save transcript in markdown format in chronological order"""
@@ -294,83 +322,53 @@ class AudioFileMonitor:
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(json_data, f, ensure_ascii=False, indent=4)
 
-    def process_existing_files(self):
-        """Process any existing audio files in all monitored directories"""
-        for input_dir in self.input_dirs:
-            input_path = Path(input_dir)
-            if not input_path.exists():
-                logger.warning(f"Directory {input_path} does not exist, skipping")
-                continue
-
-            audio_files = list(input_path.glob("*.[mM][pP]3")) + list(input_path.glob("*.[mM]4[aA]")) + list(input_path.glob("*.[mM][pP]4"))
-
-            if audio_files:
-                logger.info(f"Found {len(audio_files)} existing audio file(s) in {input_path}:")
-                for audio_file in audio_files:
-                    logger.info(f"  - {audio_file.name}")
-                    self.process_audio_file(str(audio_file))
-            else:
-                logger.info(f"No existing audio files found in {input_path}")
-
-    def monitor_directories(self):
-        """Monitor all input directories for new audio files"""
-        logger.info(f"Monitoring {len(self.input_dirs)} directories:")
-        for input_dir in self.input_dirs:
-            logger.info(f"  - {input_dir.absolute()}")
+    def process_bucket_once(self):
+        """Process currently available audio objects from S3 input bucket once."""
+        logger.info(f"Running single-pass processing for S3 bucket: s3://{self.input_bucket}")
         logger.info("Language detection:")
         logger.info("  - Files with '-en.mp3', '-en.m4a', '-en.mp4' or '-en-' in filename: English transcription")
         logger.info("  - All other files: Finnish transcription (default)")
-        logger.info("Drop MP3, M4A, or MP4 files into any monitored directory to start transcription")
-        logger.info("For MP4 files, only the audio track will be processed")
-        logger.info("Files will be processed after recording is completed (filename date/time no longer matches file modification time)")
-        logger.info("Press Ctrl+C to stop monitoring")
-
+        logger.info(f"Output bucket: s3://{self.output_bucket}")
+        logger.info("Supported formats: MP3, M4A, MP4")
         try:
-            while True:
-                # Check for new audio files in all monitored directories
-                for input_dir in self.input_dirs:
-                    input_path = Path(input_dir)
-                    if not input_path.exists():
-                        continue
+            audio_objects = self.list_audio_objects()
 
-                    audio_files = list(input_path.glob("*.[mM][pP]3")) + list(input_path.glob("*.[mM]4[aA]")) + list(input_path.glob("*.[mM][pP]4"))
+            if audio_objects:
+                logger.info(f"Found {len(audio_objects)} audio object(s) in input bucket")
+            else:
+                logger.info("No audio objects found in input bucket")
+                return
 
-                    for audio_file in audio_files:
-                        # Check if file is still being recorded
-                        if not self.is_recording(audio_file):
-                            logger.info(f"File is ready (recording finished), processing: {audio_file.name} from {input_dir}")
-                            self.process_audio_file(str(audio_file))
-                        else:
-                            # File is still being recorded
-                            logger.info(f"File is still being recorded, waiting: {audio_file.name}")
-
-                time.sleep(5)  # Polling interval
-
-        except KeyboardInterrupt:
-            logger.info("Stopping directory monitor...")
+            for obj in audio_objects:
+                object_key = obj["Key"]
+                if self.is_already_processed(object_key):
+                    logger.info(f"Skipping already processed object: {object_key}")
+                    continue
+                if not self.is_recording(object_key, obj["LastModified"]):
+                    logger.info(f"Object is ready (recording finished), processing: {object_key}")
+                    self.process_s3_object(object_key)
+                else:
+                    logger.info(f"Object is still being recorded, skipping for now: {object_key}")
         except Exception as e:
-            logger.error(f"Error monitoring directories: {e}")
+            logger.error(f"Error during single-pass bucket processing: {e}")
 
-    def is_recording(self, file_path):
+    def is_recording(self, object_key, last_modified):
         """
-        Check if a file is still being recorded by comparing the filename date/time
-        with the file's last modified time. Returns True if recording is in progress.
+        Check if an S3 object is likely still being recorded by comparing filename
+        timestamp with object's last modified time.
 
-        Only performs the check for files with timestamp format: YYYYMMDD_HHMM-name.ext
-        For files without this format, assumes recording is not in progress (returns False).
+        Only performs check for filenames in format: YYYYMMDD_HHMM-name.ext
+        For files without this format, assumes not recording (returns False).
         """
-        file_path = Path(file_path)
+        filename = Path(object_key).name
 
-        if not file_path.exists():
-            return False
-
-        # Pattern for filename: YYYYMMDD_HHMM-*.mp3 or *.m4a
+        # Pattern for filename: YYYYMMDD_HHMM-*.mp3 or *.m4a or *.mp4
         pattern = r'^(\d{8})_(\d{4})-.*\.(mp3|m4a|mp4)$'
-        match = re.search(pattern, file_path.name, re.IGNORECASE)
+        match = re.search(pattern, filename, re.IGNORECASE)
 
         if not match:
             # If filename doesn't match timestamp format, assume not recording
-            # This allows processing of files without timestamp format immediately
+            # This allows immediate processing of files without timestamp format
             return False
 
         date_str = match.group(1)  # YYYYMMDD
@@ -380,68 +378,32 @@ class AudioFileMonitor:
             # Parse filename date/time
             filename_datetime = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M")
 
-            # Get file's last modified time
-            file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+            # LastModified from S3 is timezone-aware UTC datetime
+            modified_dt = last_modified.replace(tzinfo=None)
 
             # Compare date and time up to the minute
-            # If they match, the file is likely still being recorded
-            return (filename_datetime.year == file_mtime.year and
-                    filename_datetime.month == file_mtime.month and
-                    filename_datetime.day == file_mtime.day and
-                    filename_datetime.hour == file_mtime.hour and
-                    filename_datetime.minute == file_mtime.minute)
+            return (
+                filename_datetime.year == modified_dt.year
+                and filename_datetime.month == modified_dt.month
+                and filename_datetime.day == modified_dt.day
+                and filename_datetime.hour == modified_dt.hour
+                and filename_datetime.minute == modified_dt.minute
+            )
 
         except ValueError as e:
-            logger.warning(f"Could not parse date/time from filename {file_path.name}: {e}")
+            logger.warning(f"Could not parse date/time from object key {object_key}: {e}")
             return False
 
 def main():
-    """Main function to start file monitoring"""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Audio File Monitor and Transcription System")
-    parser.add_argument(
-        "--input-dirs",
-        type=str,
-        nargs='*',
-        help="Specific input directories to monitor for MP3, M4A, and MP4 files (if not specified, discovers all 'input*' directories)"
-    )
-    args = parser.parse_args()
-
+    """Main function to run one-pass S3 processing."""
     logger.info("=" * 50)
-    logger.info("AUDIO FILE MONITOR AND TRANSCRIPTION SYSTEM")
+    logger.info("AUDIO FILE TRANSCRIPTION SYSTEM (S3 SINGLE RUN)")
     logger.info("=" * 50)
 
-    # Discover or use specified input directories
-    if args.input_dirs:
-        input_dirs = args.input_dirs
-        logger.info(f"Using specified directories: {', '.join(input_dirs)}")
-    else:
-        # Auto-discover all 'input*' directories in current directory
-        current_dir = Path(".")
-        input_dirs = [str(d) for d in current_dir.glob("input*") if d.is_dir()]
+    monitor = AudioFileMonitor()
+    monitor.process_bucket_once()
 
-        if not input_dirs:
-            # If no input* directories found, create and use ./input
-            logger.info("No 'input*' directories found, creating ./input")
-            input_dirs = ["./input"]
-            Path("./input").mkdir(parents=True, exist_ok=True)
-        else:
-            logger.info(f"Discovered {len(input_dirs)} input directories: {', '.join(input_dirs)}")
-
-    # Ensure all directories exist
-    for input_dir in input_dirs:
-        Path(input_dir).mkdir(parents=True, exist_ok=True)
-
-    # Create event handler
-    event_handler = AudioFileMonitor(input_dirs=input_dirs)
-
-    # Process any existing files in all input directories
-    event_handler.process_existing_files()
-
-    # Start monitoring all directories
-    event_handler.monitor_directories()
-
-    logger.info("File monitor stopped")
+    logger.info("S3 single-pass run completed")
 
 if __name__ == "__main__":
     main()
