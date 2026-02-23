@@ -177,3 +177,5 @@ input-test
 temp/
 .idea/copilot*.xml
 
+
+.container/

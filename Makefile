@@ -9,3 +9,7 @@ run-test-script: build
 
 run-bash: build
 	docker run --rm -it --runtime=nvidia --gpus all --env HF_TOKEN=$$HF_TOKEN -v ./:/app/ --entrypoint /bin/bash whisperx:latest
+
+test: build
+	docker run --rm -it --runtime=nvidia --gpus all --env HF_TOKEN=$$HF_TOKEN --env S3_INPUT_BUCKET=$$S3_INPUT_BUCKET --env S3_OUTPUT_BUCKET=$$S3_OUTPUT_BUCKET-x --env AWS_ACCESS_KEY_ID=$$AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY=$$AWS_SECRET_ACCESS_KEY --env AWS_SESSION_TOKEN=$$AWS_SESSION_TOKEN --env AWS_REGION=eu-west-1 -v ./.container:/root/ -v /tmp/whisperx:/tmp --read-only whisperx:latest
+

@@ -159,6 +159,14 @@ class AudioFileMonitor:
                 return False
             raise
 
+    def delete_s3_object(self, object_key):
+        """Delete original audio file from S3 input bucket after successful processing."""
+        try:
+            self.s3_client.delete_object(Bucket=self.input_bucket, Key=object_key)
+            logger.info(f"Deleted original audio file from S3: s3://{self.input_bucket}/{object_key}")
+        except Exception as e:
+            logger.error(f"Error deleting s3://{self.input_bucket}/{object_key}: {e}")
+
     def process_s3_object(self, object_key):
         """Process a single S3 audio object (MP3, M4A, or MP4)."""
         with self.processing_lock:
@@ -190,6 +198,9 @@ class AudioFileMonitor:
 
                     # Upload only markdown transcript (no directory prefix)
                     self.upload_markdown_transcript(target_dir, object_key)
+                    
+                    # Delete the original audio file from S3 after successful processing and upload
+                    self.delete_s3_object(object_key)
 
                 return True
 
