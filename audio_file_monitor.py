@@ -63,8 +63,9 @@ class AudioFileMonitor:
     def detect_language_from_filename(self, filename):
         """Detect language from filename patterns"""
         filename_lower = filename.lower()
-        if "-en.mp3" in filename_lower or "-en.m4a" in filename_lower or "-en.mp4" in filename_lower or "-en-" in filename_lower:
-            return "en"
+        match = re.search(r"-(\w{2})\.[a-z0-9]+$", filename_lower)
+        if match:
+            return match.group(1)
         return "fi"  # Default to Finnish
 
     def setup_whisperx(self):
